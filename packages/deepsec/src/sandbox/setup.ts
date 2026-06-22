@@ -52,6 +52,7 @@ const SANDBOX_ENV_KEYS: string[] = ["ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "DE
  * tests happy without resembling any real provider format.
  */
 const BROKERED_TOKEN_PLACEHOLDER = "deepsec-sandbox-brokered-credential";
+const PI_CUSTOM_BASE_URL_ENV = "DEEPSEC_PI_AI_BASE_URL";
 
 /**
  * Real credentials live on the orchestrator host only. The sandbox sees a
@@ -61,6 +62,16 @@ const BROKERED_TOKEN_PLACEHOLDER = "deepsec-sandbox-brokered-credential";
 interface BrokeredCredentials {
   anthropicToken?: string;
   openaiToken?: string;
+  aiGatewayToken?: string;
+  customToken?: {
+    envName: string;
+    token: string;
+  };
+}
+
+interface BrokeredCredentialOptions {
+  aiApiKeyEnv?: string;
+  aiBaseUrl?: string;
 }
 
 /**
@@ -69,14 +80,22 @@ interface BrokeredCredentials {
  * Claude and OpenAI traffic, so when only ANTHROPIC_AUTH_TOKEN is set and
  * the worker is going to run codex, fall it back as the OpenAI token.
  */
-export function resolveBrokeredCredentials(agentType: string | undefined): BrokeredCredentials {
+export function resolveBrokeredCredentials(
+  agentType: string | undefined,
+  options: BrokeredCredentialOptions = {},
+): BrokeredCredentials {
   const anthropicToken = process.env.ANTHROPIC_AUTH_TOKEN;
   const explicitOpenai = process.env.OPENAI_API_KEY;
+  const aiGatewayToken = agentType === "pi" ? process.env.AI_GATEWAY_API_KEY : undefined;
+  const customToken =
+    agentType === "pi" && options.aiApiKeyEnv && process.env[options.aiApiKeyEnv]
+      ? { envName: options.aiApiKeyEnv, token: process.env[options.aiApiKeyEnv]! }
+      : undefined;
   // Only borrow ANTHROPIC for OPENAI on the codex path — and only when the
   // user hasn't pinned an explicit OpenAI key. Outside codex this fallback
   // would never hit the network anyway, but scoping it keeps intent clear.
   const openaiToken = explicitOpenai ?? (agentType === "codex" ? anthropicToken : undefined);
-  return { anthropicToken, openaiToken };
+  return { anthropicToken, openaiToken, aiGatewayToken, customToken };
 }
 
 const PROXY_PORT = 8787;
@@ -95,6 +114,7 @@ const CODEX_HOME = "/vercel/sandbox/.codex";
 export function buildSandboxEnv(
   agentType: string | undefined,
   credentials: BrokeredCredentials,
+  options: BrokeredCredentialOptions = {},
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const key of SANDBOX_ENV_KEYS) {
@@ -110,6 +130,17 @@ export function buildSandboxEnv(
   }
   if (credentials.openaiToken) {
     env["OPENAI_API_KEY"] = BROKERED_TOKEN_PLACEHOLDER;
+  }
+  if (agentType === "pi") {
+    if (credentials.aiGatewayToken) {
+      env["AI_GATEWAY_API_KEY"] = BROKERED_TOKEN_PLACEHOLDER;
+    }
+    if (credentials.customToken) {
+      env[credentials.customToken.envName] = BROKERED_TOKEN_PLACEHOLDER;
+    }
+    if (options.aiBaseUrl) {
+      env[PI_CUSTOM_BASE_URL_ENV] = options.aiBaseUrl;
+    }
   }
 
   // Belt-and-suspenders alongside the worker egress firewall: the master
@@ -171,6 +202,7 @@ export function buildSandboxEnv(
 // to reach it; better to deny outright.
 const DEFAULT_ANTHROPIC_HOST = "api.anthropic.com";
 const DEFAULT_OPENAI_HOST = "api.openai.com";
+const DEFAULT_AI_GATEWAY_HOST = "ai-gateway.vercel.sh";
 
 function hostFromUrl(u: string | undefined): string | null {
   if (!u) return null;
@@ -188,18 +220,27 @@ export function buildWorkerNetworkPolicy(
   extraAllow: string[] = [],
 ): NetworkPolicy {
   const isCodex = agentType === "codex";
+  const isPi = agentType === "pi";
 
   // Single AI host per backend. Prefer derived from the base URL the agent
   // will actually use; fall back to the provider's documented default when
   // the user hasn't configured one.
-  const aiHost = isCodex
-    ? (hostFromUrl(env["OPENAI_BASE_URL"]) ?? DEFAULT_OPENAI_HOST)
-    : (hostFromUrl(env["ANTHROPIC_UPSTREAM_BASE_URL"]) ?? DEFAULT_ANTHROPIC_HOST);
+  const aiHost = isPi
+    ? (hostFromUrl(env[PI_CUSTOM_BASE_URL_ENV]) ?? DEFAULT_AI_GATEWAY_HOST)
+    : isCodex
+      ? (hostFromUrl(env["OPENAI_BASE_URL"]) ?? DEFAULT_OPENAI_HOST)
+      : (hostFromUrl(env["ANTHROPIC_UPSTREAM_BASE_URL"]) ?? DEFAULT_ANTHROPIC_HOST);
 
   // The fallback flips at resolveBrokeredCredentials — by here, openaiToken
   // already carries the ANTHROPIC gateway token if the user only set that
   // one and is running codex.
-  const injectToken = isCodex ? credentials.openaiToken : credentials.anthropicToken;
+  const injectToken = isPi
+    ? env[PI_CUSTOM_BASE_URL_ENV]
+      ? credentials.customToken?.token
+      : credentials.aiGatewayToken
+    : isCodex
+      ? credentials.openaiToken
+      : credentials.anthropicToken;
 
   const allow: Record<string, NetworkPolicyRule[]> = {
     [aiHost]: injectToken
@@ -278,10 +319,10 @@ export async function createBootstrapSnapshot(opts: BootstrapOptions): Promise<s
     });
     opts.onLog("  pnpm installed.");
 
-    // Install ripgrep + python3 — Codex agents prefer rg/python over grep/awk
+    // Install ripgrep + fd + python3. Agents prefer rg/fd over grep/find
     // for whole-tree searches, and several investigation patterns lean on
     // python3 for parsing AST / JSON. Best-effort: warn but don't fail the
-    // whole bootstrap if the package manager rejects either one.
+    // whole bootstrap if the package manager rejects any of them.
     await installAgentTools(sandbox, opts.onLog);
 
     // Upload app + target + data in parallel
@@ -352,6 +393,8 @@ interface SpawnOptions {
   snapshotId: string;
   /** Drives which API base URL gets rewritten to the local proxy */
   agentType?: string;
+  aiApiKeyEnv?: string;
+  aiBaseUrl?: string;
   vcpus: number;
   timeout: number;
   /** Source repo vs. user's `.deepsec/` install — see DeepsecMode docstring */
@@ -373,8 +416,12 @@ export async function spawnFromSnapshot(opts: SpawnOptions): Promise<Sandbox> {
   // and (b) which Authorization header the firewall transform should inject.
   // Reading process.env directly here keeps the real token out of any data
   // structure that's later passed to Sandbox.create({ env }).
-  const credentials = resolveBrokeredCredentials(opts.agentType);
-  const sandboxEnv = buildSandboxEnv(opts.agentType, credentials);
+  const credentialOptions = {
+    aiApiKeyEnv: opts.aiApiKeyEnv,
+    aiBaseUrl: opts.aiBaseUrl,
+  };
+  const credentials = resolveBrokeredCredentials(opts.agentType, credentialOptions);
+  const sandboxEnv = buildSandboxEnv(opts.agentType, credentials, credentialOptions);
   const networkPolicy = buildWorkerNetworkPolicy(
     sandboxEnv,
     opts.agentType,
@@ -539,15 +586,15 @@ rm -rf /tmp/claude-native-fetch
 }
 
 /**
- * Install ripgrep + python3 in the bootstrap sandbox so the Codex agent has
+ * Install ripgrep + fd + python3 in the bootstrap sandbox so agents have
  * efficient whole-tree search and a scripting language for ad-hoc analysis.
  * Detects the available package manager (dnf / microdnf / yum / apt-get).
  *
  * Best-effort: if neither tool can be installed, we log and move on. The
  * agent can fall back to grep / awk / shell.
  */
-async function installAgentTools(sandbox: Sandbox, onLog: (msg: string) => void): Promise<void> {
-  const script = `
+export function buildInstallAgentToolsScript(): string {
+  return `
 set -u
 log() { echo "  $*"; }
 
@@ -575,6 +622,39 @@ install_with() {
       apk add --no-cache "$pkg" 2>&1 | tail -5
       ;;
   esac
+}
+
+ensure_fd_alias() {
+  if command -v fd >/dev/null 2>&1; then return 0; fi
+  if command -v fdfind >/dev/null 2>&1; then
+    ln -sf "$(command -v fdfind)" /usr/local/bin/fd 2>/dev/null || true
+  fi
+}
+
+install_fd_from_github() {
+  local arch=""
+  case "$(uname -m)" in
+    x86_64) arch="x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) arch="aarch64-unknown-linux-gnu" ;;
+    *) log "WARN: unsupported arch $(uname -m) for fd prebuilt"; return 1 ;;
+  esac
+  local rel="10.3.0"
+  local url="https://github.com/sharkdp/fd/releases/download/v\${rel}/fd-v\${rel}-\${arch}.tar.gz"
+  log "Downloading fd \${rel} (\${arch}) from GitHub..."
+  rm -rf /tmp/fd-fetch && mkdir -p /tmp/fd-fetch && cd /tmp/fd-fetch
+  if ! curl -fsSL --retry 3 -o fd.tar.gz "\${url}"; then
+    log "WARN: fd download failed: \${url}"
+    return 1
+  fi
+  tar -xzf fd.tar.gz
+  local bin
+  bin=$(find . -maxdepth 3 -name fd -type f | head -1)
+  if [ -z "\${bin}" ]; then
+    log "WARN: fd binary not found in tarball"
+    return 1
+  fi
+  install -m 0755 "\${bin}" /usr/local/bin/fd
+  cd / && rm -rf /tmp/fd-fetch
 }
 
 # ripgrep: try the package manager first (Debian/Ubuntu/Alpine ship it),
@@ -622,6 +702,34 @@ else
   fi
 fi
 
+if command -v fd >/dev/null 2>&1 || command -v fdfind >/dev/null 2>&1; then
+  ensure_fd_alias
+  log "fd already installed: $(fd --version 2>/dev/null || fdfind --version | head -1)"
+else
+  log "Installing fd via package manager..."
+  case "$PM" in
+    apt-get)
+      install_with fd-find || true
+      ;;
+    apk)
+      install_with fd || true
+      ;;
+    *)
+      install_with fd-find || true
+      install_with fd || true
+      ;;
+  esac
+  ensure_fd_alias
+  if ! command -v fd >/dev/null 2>&1; then
+    install_fd_from_github || true
+  fi
+  if command -v fd >/dev/null 2>&1; then
+    log "fd ready: $(fd --version | head -1)"
+  else
+    log "WARN: fd still not on PATH — agents will fall back to find/glob implementations"
+  fi
+fi
+
 # python3: usually preinstalled on AL2023 / Ubuntu, but cover the edge case
 if command -v python3 >/dev/null 2>&1; then
   log "python3 already installed: $(python3 --version)"
@@ -632,6 +740,10 @@ else
 fi
 exit 0
 `;
+}
+
+async function installAgentTools(sandbox: Sandbox, onLog: (msg: string) => void): Promise<void> {
+  const script = buildInstallAgentToolsScript();
   const result = await sandbox.runCommand({
     cmd: "bash",
     args: ["-c", script],
